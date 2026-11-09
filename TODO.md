@@ -7,7 +7,7 @@
 
 - [ ] 校区：`待填写`
 - [ ] 姓名：`待填写`
-- [ ] GitHub 仓库链接：`待实验优化完成后填写`
+- [x] GitHub 仓库链接：`https://github.com/clearfrosty/fvs-course-lab-gateann-optimization`
 - [ ] 确认具体提交时间、提交平台及是否需要 PDF 备份
 
 最终文件名：
