@@ -1,0 +1,437 @@
+diff --git a/include/ssd_index.h b/include/ssd_index.h
+index 7bd2945..933190e 100644
+--- a/include/ssd_index.h
++++ b/include/ssd_index.h
+@@ -380,6 +380,18 @@ namespace pipeann {
+     }
+     void set_filter_precheck(bool v)       { filter_precheck_ = v; }
+     void set_early_filter_check(bool v)    { early_filter_check_ = v; }
++    void set_filter_frontier_policy(float max_ratio, float selectivity_threshold) {
++      filter_frontier_reserve_ = std::max(0.0f, std::min(1.0f, max_ratio));
++      filter_frontier_selectivity_threshold_ =
++          std::max(0.0f, std::min(1.0f, selectivity_threshold));
++    }
++    float estimate_filter_selectivity(const void *filter_data) const {
++      if (spmat_filter_ && spmat_filter_->loaded())
++        return spmat_filter_->estimate_selectivity(filter_data);
++      if (filter_store_ && filter_store_->loaded() && filter_data)
++        return filter_store_->estimate_selectivity(*(const uint8_t *)filter_data);
++      return 1.0f;
++    }
+ 
+    private:
+     // Background insert I/O commit.
+@@ -463,6 +475,10 @@ namespace pipeann {
+     std::unique_ptr<FullAdjIndex> full_adj_;
+     bool filter_precheck_ = false;  // set true only for mode=8
+     bool early_filter_check_ = false; // mode=9: check filter after IO, skip exact dist if non-matching
++    // Fraction of the fixed-L candidate pool softly reserved for nodes that
++    // satisfy the query filter. Zero exactly preserves the original frontier.
++    float filter_frontier_reserve_ = 0.0f;
++    float filter_frontier_selectivity_threshold_ = 0.015f;
+ 
+     void init_buffers(uint64_t nthreads);
+     void destroy_buffers();
+diff --git a/include/utils.h b/include/utils.h
+index 072f8fb..9eb6388 100644
+--- a/include/utils.h
++++ b/include/utils.h
+@@ -355,9 +355,14 @@ namespace pipeann {
+     float distance;
+     bool flag;
+     bool visited;
++    // Query-local candidate class used by GateANN's filter-aware frontier.
++    // It does not affect distance ordering and defaults to true so all other
++    // search modes retain their original behavior.
++    bool filter_match;
+ 
+     Neighbor() = default;
+-    Neighbor(unsigned id, float distance, bool f) : id{id}, distance{distance}, flag(f), visited(false) {
++    Neighbor(unsigned id, float distance, bool f, bool matches_filter = true)
++        : id{id}, distance{distance}, flag(f), visited(false), filter_match(matches_filter) {
+     }
+ 
+     inline bool operator<(const Neighbor &other) const {
+diff --git a/include/utils/filter_store.h b/include/utils/filter_store.h
+index 298b090..a59fe27 100644
+--- a/include/utils/filter_store.h
++++ b/include/utils/filter_store.h
+@@ -12,6 +12,7 @@
+ // =============================================================================
+ 
+ #include <cstdint>
++#include <array>
+ #include <fstream>
+ #include <stdexcept>
+ #include <string>
+@@ -30,6 +31,7 @@ class FilterStore {
+     labels_.resize(n);
+     in.read((char *)labels_.data(), n);
+     if (!in) throw std::runtime_error("FilterStore: read failed " + path);
++    rebuild_counts();
+   }
+ 
+   void save(const std::string &path) const {
+@@ -41,8 +43,13 @@ class FilterStore {
+ 
+   void resize_and_set(uint32_t n, uint8_t default_label = 0) {
+     labels_.assign(n, default_label);
++    rebuild_counts();
++  }
++  void set_label(uint32_t id, uint8_t label) {
++    --label_counts_[labels_[id]];
++    labels_[id] = label;
++    ++label_counts_[label];
+   }
+-  void set_label(uint32_t id, uint8_t label) { labels_[id] = label; }
+ 
+   // Returns true if node PASSES filter (should be IO'd and included in result).
+   bool passes(uint32_t node_id, uint8_t query_label) const {
+@@ -53,9 +60,20 @@ class FilterStore {
+   bool loaded() const { return !labels_.empty(); }
+   size_t size() const { return labels_.size(); }
+   uint8_t get_label(uint32_t id) const { return labels_[id]; }
++  float estimate_selectivity(uint8_t query_label) const {
++    if (labels_.empty()) return 1.0f;
++    return static_cast<float>(label_counts_[query_label]) /
++           static_cast<float>(labels_.size());
++  }
+ 
+  private:
++  void rebuild_counts() {
++    label_counts_.fill(0);
++    for (uint8_t label : labels_) ++label_counts_[label];
++  }
++
+   std::vector<uint8_t> labels_;
++  std::array<uint32_t, 256> label_counts_{};
+ };
+ 
+ }  // namespace pipeann
+diff --git a/include/utils/percentile_stats.h b/include/utils/percentile_stats.h
+index 6e9802a..18d7d9f 100644
+--- a/include/utils/percentile_stats.h
++++ b/include/utils/percentile_stats.h
+@@ -24,6 +24,8 @@ namespace pipeann {
+     double n_hops = 0;          // # search hops
+     double n_current_used = 0;  // # force return for latency limit
+     double n_filter_skip = 0;   // # nodes skipped by pre-IO filter check (mode=8)
++    double n_filter_promotions = 0; // matching candidates admitted via soft reserve
++    double n_filter_protections = 0; // tunnel candidates rejected to protect reserve
+ 
+     // Time breakdown (microseconds, mode=8 filter-aware search)
+     double bd_io_us = 0;        // IO submit + poll + wait
+diff --git a/include/utils/spmat_filter_store.h b/include/utils/spmat_filter_store.h
+index 48b5d26..2bf48ab 100644
+--- a/include/utils/spmat_filter_store.h
++++ b/include/utils/spmat_filter_store.h
+@@ -58,6 +58,7 @@ class SpmatFilterStore {
+ 
+     // Build CSR: flatten into indptr_ (int64) and labels_ (uint32)
+     n_nodes_ = (uint32_t)nrow;
++    label_counts_.assign(static_cast<size_t>(ncol), 0);
+     indptr_.resize(nrow + 1);
+ 
+     // First pass: count non-zero entries per row
+@@ -83,7 +84,9 @@ class SpmatFilterStore {
+     for (int64_t i = 0; i < nrow; i++) {
+       for (int64_t j = indptr[i]; j < indptr[i + 1]; j++) {
+         if (data[j] != 0.0f) {
+-          labels_[pos[i]++] = (uint32_t)indices[j];
++          const uint32_t label = (uint32_t)indices[j];
++          labels_[pos[i]++] = label;
++          if (label < label_counts_.size()) ++label_counts_[label];
+         }
+       }
+       // Sort labels for this node
+@@ -138,11 +141,32 @@ class SpmatFilterStore {
+   bool loaded() const { return n_nodes_ > 0; }
+   size_t size() const { return n_nodes_; }
+ 
++  // Returns a cheap upper bound on subset selectivity. For a single-label
++  // query this is exact; for multiple labels the rarest marginal frequency
++  // is an upper bound and is sufficient to decide whether special routing is
++  // warranted.
++  float estimate_selectivity(const void *filter_data) const {
++    if (!filter_data || n_nodes_ == 0) return 1.0f;
++    uint32_t q_count;
++    memcpy(&q_count, filter_data, sizeof(uint32_t));
++    if (q_count == 0) return 1.0f;
++    const uint32_t *q_labels =
++        (const uint32_t *)((const char *)filter_data + sizeof(uint32_t));
++    uint32_t rarest = n_nodes_;
++    for (uint32_t i = 0; i < q_count; ++i) {
++      const uint32_t label = q_labels[i];
++      const uint32_t count = label < label_counts_.size() ? label_counts_[label] : 0;
++      rarest = std::min(rarest, count);
++    }
++    return static_cast<float>(rarest) / static_cast<float>(n_nodes_);
++  }
++
+  private:
+   uint32_t n_nodes_ = 0;
+   int64_t total_labels_ = 0;
+   std::vector<int64_t> indptr_;     // n_nodes+1 entries
+   std::vector<uint32_t> labels_;    // flattened sorted labels
++  std::vector<uint32_t> label_counts_; // marginal frequency per label
+ };
+ 
+ }  // namespace pipeann
+diff --git a/src/search/pipe_search.cpp b/src/search/pipe_search.cpp
+index 65bd1c9..69d19bc 100644
+--- a/src/search/pipe_search.cpp
++++ b/src/search/pipe_search.cpp
+@@ -82,6 +82,110 @@ namespace pipeann {
+     std::vector<Neighbor> retset(mem_L + this->params.R + effective_lsearch * 10);
+     auto &visited = *(query_buf->visited);
+     unsigned cur_list_size = 0;
++    unsigned filter_match_count = 0;
++
++    const float estimated_filter_selectivity =
++        this->estimate_filter_selectivity(filter_data);
++    const bool use_filter_frontier =
++        this->filter_precheck_ && filter_data != nullptr &&
++        this->filter_frontier_reserve_ > 0.0f &&
++        this->filter_frontier_selectivity_threshold_ > 0.0f &&
++        estimated_filter_selectivity < this->filter_frontier_selectivity_threshold_ &&
++        ((this->filter_store_ && this->filter_store_->loaded()) ||
++         (this->spmat_filter_ && this->spmat_filter_->loaded()));
++    const float adaptive_reserve_ratio = use_filter_frontier
++        ? this->filter_frontier_reserve_ *
++              (this->filter_frontier_selectivity_threshold_ - estimated_filter_selectivity) /
++              this->filter_frontier_selectivity_threshold_
++        : 0.0f;
++    const unsigned filter_match_reserve = use_filter_frontier
++        ? std::min(effective_lsearch,
++                   static_cast<unsigned>(std::ceil(
++                       effective_lsearch * adaptive_reserve_ratio)))
++        : 0;
++
++    auto classify_candidate = [&](Neighbor &candidate) {
++      candidate.filter_match = !use_filter_frontier ||
++          this->check_filter(candidate.id, filter_data);
++    };
++
++    // Work-conserving fixed-budget frontier. Tunnel candidates may borrow all
++    // unused slots, but matching candidates can reclaim their soft reserve.
++    // Total pool capacity remains effective_lsearch, so comparisons at the
++    // same L do not hide extra search work in a larger frontier.
++    auto insert_frontier_candidate = [&](Neighbor candidate) -> unsigned {
++      classify_candidate(candidate);
++
++      if (cur_list_size < effective_lsearch) {
++        const unsigned position = InsertIntoPool(retset.data(), cur_list_size, candidate);
++        ++cur_list_size;
++        if (candidate.filter_match) ++filter_match_count;
++        if (unlikely(cur_list_size >= retset.size())) retset.resize(2 * cur_list_size);
++        return position;
++      }
++
++      if (!use_filter_frontier) {
++        const bool evicted_match = retset[cur_list_size - 1].filter_match;
++        const unsigned position = InsertIntoPool(retset.data(), cur_list_size, candidate);
++        if (position < cur_list_size) {
++          filter_match_count += static_cast<unsigned>(candidate.filter_match);
++          filter_match_count -= static_cast<unsigned>(evicted_match);
++        }
++        return position;
++      }
++
++      auto worst_replaceable_tunnel = [&]() -> int {
++        for (int i = static_cast<int>(cur_list_size) - 1; i >= 0; --i) {
++          if (!retset[i].filter_match && retset[i].flag && !retset[i].visited)
++            return i;
++        }
++        return -1;
++      };
++
++      auto replace_at = [&](unsigned evict_at) -> unsigned {
++        const bool evicted_match = retset[evict_at].filter_match;
++        if (evict_at + 1 < cur_list_size) {
++          memmove(&retset[evict_at], &retset[evict_at + 1],
++                  (cur_list_size - evict_at - 1) * sizeof(Neighbor));
++        }
++        --cur_list_size;
++        const unsigned position = InsertIntoPool(retset.data(), cur_list_size, candidate);
++        ++cur_list_size;
++        filter_match_count += static_cast<unsigned>(candidate.filter_match);
++        filter_match_count -= static_cast<unsigned>(evicted_match);
++        return std::min(position, evict_at);
++      };
++
++      if (candidate.filter_match && filter_match_count < filter_match_reserve) {
++        const int tunnel_at = worst_replaceable_tunnel();
++        if (tunnel_at >= 0) {
++          if (stats != nullptr) ++stats->n_filter_promotions;
++          return replace_at(static_cast<unsigned>(tunnel_at));
++        }
++      }
++
++      // A tunnel candidate may not evict one of the reserved matching slots.
++      if (!candidate.filter_match && filter_match_count <= filter_match_reserve &&
++          retset[cur_list_size - 1].filter_match) {
++        const int tunnel_at = worst_replaceable_tunnel();
++        if (tunnel_at < 0 || candidate.distance >= retset[tunnel_at].distance) {
++          if (stats != nullptr) ++stats->n_filter_protections;
++          return cur_list_size;
++        }
++        if (stats != nullptr) ++stats->n_filter_protections;
++        return replace_at(static_cast<unsigned>(tunnel_at));
++      }
++
++      if (candidate.distance >= retset[cur_list_size - 1].distance)
++        return cur_list_size;
++      const bool evicted_match = retset[cur_list_size - 1].filter_match;
++      const unsigned position = InsertIntoPool(retset.data(), cur_list_size, candidate);
++      if (position < cur_list_size) {
++        filter_match_count += static_cast<unsigned>(candidate.filter_match);
++        filter_match_count -= static_cast<unsigned>(evicted_match);
++      }
++      return position;
++    };
+ 
+     std::vector<Neighbor> full_retset;
+     full_retset.reserve(l_search * 10);
+@@ -123,17 +227,12 @@ namespace pipeann {
+             stats->n_cmps++;
+           }
+ 
+-          if (nbor_dist >= retset[cur_list_size - 1].distance && (cur_list_size == effective_lsearch))
++          if (!use_filter_frontier && nbor_dist >= retset[cur_list_size - 1].distance &&
++              (cur_list_size == effective_lsearch))
+             continue;
+           Neighbor nn(nbor_id, nbor_dist, true);
+-          // Return position in sorted list where nn inserted
+-          auto r = InsertIntoPool(retset.data(), cur_list_size, nn);  // may be overflow in retset...
+-          if (cur_list_size < effective_lsearch) {
+-            ++cur_list_size;
+-            if (unlikely(cur_list_size >= retset.size())) {
+-              retset.resize(2 * cur_list_size);
+-            }
+-          }
++          // Return position in sorted list where nn inserted.
++          auto r = insert_frontier_candidate(nn);
+           // nk logs the best position in the retset that was updated due to
+           // neighbors of n.
+           if (r < nk)
+@@ -171,16 +270,10 @@ namespace pipeann {
+             memcpy(data_buf, nbr_node.coords, meta_.data_dim * sizeof(T));
+             nbor_dist = dist_cmp->compare(query, data_buf, (unsigned)aligned_dim);
+           }
+-          if (nbor_dist >= thresh) continue;
++          if (!use_filter_frontier && nbor_dist >= thresh) continue;
+           if (stats != nullptr) stats->n_cmps++;
+           Neighbor nn(nbor_id, nbor_dist, true);
+-          auto r = InsertIntoPool(retset.data(), cur_list_size, nn);
+-          if (cur_list_size < effective_lsearch) {
+-            ++cur_list_size;
+-            if (unlikely(cur_list_size >= retset.size())) {
+-              retset.resize(2 * cur_list_size);
+-            }
+-          }
++          auto r = insert_frontier_candidate(nn);
+           if (r < nk) nk = r;
+         }
+       }
+@@ -188,7 +281,10 @@ namespace pipeann {
+ 
+     auto add_to_retset = [&](const unsigned *node_ids, const uint64_t n_ids, float *dists) {
+       for (uint64_t i = 0; i < n_ids; ++i) {
+-        retset[cur_list_size++] = Neighbor(node_ids[i], dists[i], true);
++        Neighbor candidate(node_ids[i], dists[i], true);
++        classify_candidate(candidate);
++        retset[cur_list_size++] = candidate;
++        if (candidate.filter_match) ++filter_match_count;
+         visited.insert(node_ids[i]);
+       }
+     };
+@@ -307,7 +403,10 @@ namespace pipeann {
+         if (this->filter_precheck_ && filter_data != nullptr &&
+             ((this->filter_store_ && this->filter_store_->loaded()) ||
+              (this->spmat_filter_ && this->spmat_filter_->loaded()))) {
+-          if (!this->check_filter(retset[marker].id, filter_data)) {
++          const bool candidate_matches = use_filter_frontier
++              ? retset[marker].filter_match
++              : this->check_filter(retset[marker].id, filter_data);
++          if (!candidate_matches) {
+             auto bd_tunnel_st = std::chrono::high_resolution_clock::now();
+             retset[marker].flag    = false;
+             retset[marker].visited = true;
+@@ -328,11 +427,10 @@ namespace pipeann {
+                 nbr_handler->compute_dists(query_buf, temp_nbrs, cnt);
+                 for (unsigned m = 0; m < cnt; m++) {
+                   float d = dist_scratch[m];
+-                  if (cur_list_size < effective_lsearch ||
++                  if (use_filter_frontier || cur_list_size < effective_lsearch ||
+                       d < retset[cur_list_size - 1].distance) {
+                     Neighbor nn(temp_nbrs[m], d, true);
+-                    auto r = InsertIntoPool(retset.data(), cur_list_size, nn);
+-                    if (cur_list_size < effective_lsearch) ++cur_list_size;
++                    auto r = insert_frontier_candidate(nn);
+                     if (r < marker) marker = r;  // rescan if inserted before marker
+                   }
+                 }
+diff --git a/tests/search_disk_index_yfcc.cpp b/tests/search_disk_index_yfcc.cpp
+index e193967..096eb3d 100644
+--- a/tests/search_disk_index_yfcc.cpp
++++ b/tests/search_disk_index_yfcc.cpp
+@@ -16,6 +16,7 @@
+ // =============================================================================
+ 
+ #include <omp.h>
++#include <cstdlib>
+ #include <iomanip>
+ #include <fstream>
+ #include <string>
+@@ -210,6 +211,17 @@ int run(int argc, char **argv) {
+   if (search_mode == FILTER_AWARE_PIPE_SEARCH) {
+     idx_->build_full_adj(full_adj_nbrs);
+     idx_->set_filter_precheck(true);
++    float frontier_reserve = 0.0f;
++    float frontier_threshold = 0.015f;
++    if (const char *value = std::getenv("GATEANN_FRONTIER_RESERVE")) {
++      frontier_reserve = std::strtof(value, nullptr);
++    }
++    if (const char *value = std::getenv("GATEANN_FRONTIER_SELECTIVITY_THRESHOLD")) {
++      frontier_threshold = std::strtof(value, nullptr);
++    }
++    idx_->set_filter_frontier_policy(frontier_reserve, frontier_threshold);
++    std::cout << "Filter frontier policy: max_reserve=" << frontier_reserve
++              << ", selectivity_threshold=" << frontier_threshold << std::endl;
+   }
+ 
+   // Selector for mode=2 post-filter baseline
+@@ -231,8 +243,10 @@ int run(int argc, char **argv) {
+             << std::setw(12) << "IO_us"
+             << std::setw(12) << "Tunnel_us"
+             << std::setw(12) << "Process_us"
++            << std::setw(12) << "Promotions"
++            << std::setw(12) << "Protections"
+             << "\n";
+-  std::cout << std::string(96, '-') << std::endl;
++  std::cout << std::string(120, '-') << std::endl;
+ 
+   for (size_t test_id = 0; test_id < Lvec.size(); test_id++) {
+     uint64_t L = Lvec[test_id];
+@@ -278,6 +292,12 @@ int run(int argc, char **argv) {
+     double mean_bd_process = pipeann::get_mean_stats(
+         stats.data(), query_num,
+         [](const pipeann::QueryStats &s) { return s.bd_process_us; });
++    double mean_promotions = pipeann::get_mean_stats(
++        stats.data(), query_num,
++        [](const pipeann::QueryStats &s) { return s.n_filter_promotions; });
++    double mean_protections = pipeann::get_mean_stats(
++        stats.data(), query_num,
++        [](const pipeann::QueryStats &s) { return s.n_filter_protections; });
+ 
+     std::cout << std::setw(6)  << L
+               << std::setw(12) << std::fixed << std::setprecision(0) << qps
+@@ -287,6 +307,8 @@ int run(int argc, char **argv) {
+               << std::setw(12) << std::fixed << std::setprecision(0) << mean_bd_io
+               << std::setw(12) << std::fixed << std::setprecision(0) << mean_bd_tunnel
+               << std::setw(12) << std::fixed << std::setprecision(0) << mean_bd_process
++              << std::setw(12) << std::fixed << std::setprecision(2) << mean_promotions
++              << std::setw(12) << std::fixed << std::setprecision(2) << mean_protections
+               << std::endl;
+   }
+ 

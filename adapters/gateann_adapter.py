@@ -44,6 +44,14 @@ def parser() -> argparse.ArgumentParser:
     search_parser.add_argument("--full-adj-neighbors", type=int, default=32)
     search_parser.add_argument("--mem-L", type=int, default=0)
     search_parser.add_argument("--cache-budget", type=int, default=0)
+    search_parser.add_argument(
+        "--frontier-max-reserve", type=float, default=0.0,
+        help="maximum soft reserve for matching candidates (0 disables the optimization)",
+    )
+    search_parser.add_argument(
+        "--frontier-selectivity-threshold", type=float, default=0.015,
+        help="disable the optimized frontier at or above this estimated selectivity",
+    )
     search_parser.set_defaults(L=[160, 320, 640])
     return top
 
@@ -59,7 +67,7 @@ def parse_results(text: str, args: argparse.Namespace) -> list[dict]:
     rows = []
     requested = set(args.L)
     for values in numeric_rows(text, 8):
-        if len(values) != 8 or int(values[0]) not in requested:
+        if len(values) < 8 or int(values[0]) not in requested:
             continue
         qps = values[1]
         rows.append(
@@ -130,6 +138,10 @@ def run() -> int:
         return 0
 
     validate_positive(args, ["threads", "beamwidth", "k", "L", "full_adj_neighbors"])
+    if not 0.0 <= args.frontier_max_reserve <= 1.0:
+        raise ValueError("--frontier-max-reserve must be in [0, 1]")
+    if not 0.0 < args.frontier_selectivity_threshold <= 1.0:
+        raise ValueError("--frontier-selectivity-threshold must be in (0, 1]")
     if args.k > info["ground_truth_k"]:
         raise ValueError(f"k={args.k} exceeds ground-truth k={info['ground_truth_k']}")
     if not signature.is_file() and not args.dry_run:
@@ -137,6 +149,9 @@ def run() -> int:
     output_dir = result_directory(args, SYSTEM, tier)
     workload = info["workload_dir"]
     command = [
+        "/usr/bin/env",
+        f"GATEANN_FRONTIER_RESERVE={args.frontier_max_reserve}",
+        f"GATEANN_FRONTIER_SELECTIVITY_THRESHOLD={args.frontier_selectivity_threshold}",
         str(search_bin), "uint8", str(prefix), str(args.threads),
         str(args.beamwidth), str(workload / "query.u8bin"),
         str(tier / "base.metadata.spmat"),
@@ -147,7 +162,14 @@ def run() -> int:
     ]
     text = run_logged(
         command, output_dir,
-        {"system": SYSTEM, "tier": tier.name, "bucket": args.bucket, "dataset": info},
+        {
+            "system": SYSTEM,
+            "tier": tier.name,
+            "bucket": args.bucket,
+            "dataset": info,
+            "frontier_max_reserve": args.frontier_max_reserve,
+            "frontier_selectivity_threshold": args.frontier_selectivity_threshold,
+        },
         args.dry_run,
     )
     if args.dry_run:
